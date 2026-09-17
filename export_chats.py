@@ -16,10 +16,13 @@ Usage:
     python export_chats.py --limit 3      # small test run first (recommended)
     python export_chats.py --csv my.csv   # export a specific list instead
     python export_chats.py --rediscover   # refresh chats.csv from the account
+    python export_chats.py --update       # ...and re-export chats that changed
 
 The chat list is saved to chats.csv on first run and reused afterwards, so
 folder numbering stays stable. Re-running skips chats already exported —
-safe to interrupt and resume at any time.
+safe to interrupt and resume at any time. To keep an archive current, run
+with --update: it re-lists the account, exports new chats, and re-exports
+any chat whose last-updated time on ChatGPT is newer than the export.
 
 Rate limits: ChatGPT throttles bulk access ("You're making requests too
 quickly"). The script paces itself, backs off in escalating steps when
@@ -34,6 +37,7 @@ import random
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -65,6 +69,49 @@ def sanitize(name, max_len=60):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
     name = re.sub(r"\s+", " ", name).strip().strip(". ")
     return name[:max_len].strip() or "untitled"
+
+
+def to_epoch(value):
+    """Epoch seconds from an API timestamp: a number, or an ISO-8601 string
+    such as 2026-09-15T19:10:09.161436Z. None if it can't be parsed."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)  # fromisoformat: max 6 fraction digits
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def local_update_time(folder):
+    """The update_time recorded in an exported conversation.json, or None."""
+    path = folder / "conversation.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r'"update_time":\s*([0-9.]+)', f.read(4096))
+        if m:
+            return float(m.group(1))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return to_epoch(data.get("update_time")) if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def is_updated(folder, remote_ts, slack_s=2.0):
+    """True if ChatGPT reports the chat changed after we exported it (or the
+    export can't be read, in which case it is fetched again to be safe)."""
+    if remote_ts is None:
+        return False
+    local_ts = local_update_time(folder)
+    return local_ts is None or remote_ts > local_ts + slack_s
 
 
 # ------------------------------------------------------------------ session
@@ -170,7 +217,8 @@ def discover_main(page, headers):
             break
         time.sleep(random.uniform(2, 4))
     return [
-        (f"{BASE_URL}/c/{it['id']}", it["id"], it.get("title") or "untitled")
+        (f"{BASE_URL}/c/{it['id']}", it["id"], it.get("title") or "untitled",
+         to_epoch(it.get("update_time")))
         for it in items if it.get("id")
     ]
 
@@ -218,6 +266,7 @@ def discover_projects(page, headers):
                         f"{BASE_URL}/g/{gid}/c/{it['id']}",
                         it["id"],
                         it.get("title") or "untitled",
+                        to_epoch(it.get("update_time")),
                     ))
             got += len(batch)
             nxt = data.get("cursor")
@@ -232,7 +281,10 @@ def discover_projects(page, headers):
 def discover_chats(page, csv_path, headers):
     """Discover all conversations (main sidebar + every project) and merge
     them into csv_path, preserving existing rows and their order so that
-    export folder numbering stays stable across runs."""
+    export folder numbering stays stable across runs.
+
+    Returns {conversation_id: last update time on ChatGPT (epoch seconds)}
+    for everything found, which --update compares against the exports."""
     log("Discovering conversations in this account...")
     found = discover_main(page, headers)
     log("Discovering project conversations...")
@@ -249,8 +301,10 @@ def discover_chats(page, csv_path, headers):
                                               row[1].strip() if len(row) > 1 else "untitled"])
                         existing_ids.add(m.group(1))
 
-    new_rows = []
-    for url, cid, title in found:
+    new_rows, remote_updated = [], {}
+    for url, cid, title, updated in found:
+        if updated is not None and updated > remote_updated.get(cid, 0.0):
+            remote_updated[cid] = updated
         if cid not in existing_ids:
             existing_ids.add(cid)
             new_rows.append([url, title])
@@ -259,6 +313,7 @@ def discover_chats(page, csv_path, headers):
         w.writerow(["url", "title"])
         w.writerows(existing_rows + new_rows)
     log(f"{csv_path}: kept {len(existing_rows)} existing, added {len(new_rows)} new")
+    return remote_updated
 
 
 def read_chat_list(csv_path):
@@ -710,6 +765,10 @@ def main():
     ap.add_argument("--rediscover", action="store_true",
                     help="refresh chats.csv from the account before exporting "
                          "(new chats are appended; existing rows keep their order)")
+    ap.add_argument("--update", action="store_true",
+                    help="keep an existing archive current: like --rediscover, "
+                         "but also re-export chats whose last-updated time on "
+                         "ChatGPT is newer than the exported copy")
     ap.add_argument("--fix-files", action="store_true",
                     help="don't re-export conversations; instead revisit every "
                          "already-exported chat and fetch any missing attachments, "
@@ -729,7 +788,7 @@ def main():
     errors_path = args.out / "errors.log"
     new_manifest = not manifest_path.exists()
 
-    exported = skipped = failed_n = 0
+    exported = updated = skipped = failed_n = 0
     extra_delay = 0.0  # grows every time the server throttles us
 
     with sync_playwright() as p, open(
@@ -764,24 +823,35 @@ def main():
             return
 
         auth = capture_auth(page)
-        if args.rediscover or not args.csv.exists():
-            discover_chats(page, args.csv, auth)
+        remote_updated = {}
+        if args.update or args.rediscover or not args.csv.exists():
+            remote_updated = discover_chats(page, args.csv, auth)
         chats = read_chat_list(args.csv)
         if args.limit:
             chats = chats[: args.limit]
-        log(f"{len(chats)} chats to process")
 
+        # decide up front what each chat needs, so the summary below is exact
+        todo = []  # (index, url, cid, title, folder, is_update)
         for i, (url, cid, title) in enumerate(chats, 1):
             folder = args.out / f"{i:03d}_{sanitize(title)}_{cid[:8]}"
-            if (folder / "conversation.json").exists():
+            if not (folder / "conversation.json").exists():
+                todo.append((i, url, cid, title, folder, False))
+            elif args.update and is_updated(folder, remote_updated.get(cid)):
+                todo.append((i, url, cid, title, folder, True))
+            else:
                 skipped += 1
-                continue
+        n_new = sum(1 for t in todo if not t[5])
+        n_upd = len(todo) - n_new
+        log(f"{len(chats)} chats in list: {skipped} already exported, {n_new} new"
+            + (f", {n_upd} changed on ChatGPT since export" if args.update else ""))
 
+        for i, url, cid, title, folder, is_update in todo:
             def err(msg, _t=title, _u=url):
                 ef.write(f"[{_t}] {_u}\n    {msg}\n")
                 ef.flush()
 
-            log(f"[{i}/{len(chats)}] {title}")
+            log(f"[{i}/{len(chats)}] {title}"
+                + ("  (changed, re-exporting)" if is_update else ""))
             data = None
             attempt = rl_hits = 0
             while attempt < MAX_ATTEMPTS and rl_hits < len(RATE_LIMIT_BACKOFFS_S) + 1:
@@ -849,16 +919,21 @@ def main():
                 json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8"
             )
             manifest.writerow(
-                [url, title, folder.name, "ok", n_msgs, f_ok, f_fail]
+                [url, title, folder.name, "updated" if is_update else "ok",
+                 n_msgs, f_ok, f_fail]
             )
             mf.flush()
-            exported += 1
+            if is_update:
+                updated += 1
+            else:
+                exported += 1
             if rl_hits:
                 extra_delay = min(extra_delay + EXTRA_DELAY_PER_429 * rl_hits, EXTRA_DELAY_CAP)
                 log(f"    pace slowed: +{extra_delay:.0f}s per chat from now on")
-            if exported % LONG_BREAK_EVERY == 0:
+            done = exported + updated
+            if done % LONG_BREAK_EVERY == 0:
                 pause = random.uniform(*LONG_BREAK_S)
-                log(f"    taking a {int(pause)}s breather after {exported} chats...")
+                log(f"    taking a {int(pause)}s breather after {done} chats...")
                 time.sleep(pause)
             time.sleep(random.uniform(*DELAY_RANGE) + extra_delay)
 
@@ -866,7 +941,8 @@ def main():
         context.close()
 
     log("")
-    log(f"Done. exported={exported} skipped(already done)={skipped} failed={failed_n}")
+    log(f"Done. exported={exported} updated={updated} "
+        f"skipped(already done)={skipped} failed={failed_n}")
     if failed_n:
         log(f"Failures listed in {errors_path} — re-run to retry just those chats.")
     log("Next: python build_viewer.py  (creates export/viewer.html)")
