@@ -11,6 +11,15 @@ that gap: it exports **every conversation — text and attached files — to
 your own computer**, then builds a beautiful, searchable, offline archive
 you can keep forever. (It works on personal accounts too.)
 
+> **About this fork.** This is
+> [tschiavo/scrapemychats](https://github.com/tschiavo/scrapemychats), a fork
+> of [Conradqh/scrapemychats](https://github.com/Conradqh/scrapemychats) that
+> carries two changes not yet merged upstream: the fix for the ChatGPT
+> endpoint change that made every export fail with 0 messages
+> ([upstream PR #2](https://github.com/Conradqh/scrapemychats/pull/2)), and
+> `--update` for keeping an existing archive current
+> ([upstream PR #4](https://github.com/Conradqh/scrapemychats/pull/4)).
+
 **Your data never leaves your machine.** The tool drives a real Chrome
 window on your computer using your own logged-in ChatGPT session. It never
 sees your password, and nothing is sent anywhere except to chatgpt.com
